@@ -1,0 +1,31 @@
+skref til að keyra project
+
+1. make clean og make þu kannt þetta
+
+
+2. hafa 1 terminal opið(köllum það server A)
+	keyra following: ./tsamgroup117 4044 "A117 1"
+kemur örruglega ekki neitt upp en það er normal
+
+3. haf 2 terminal opip(köllum það server B)
+	keyrra following: ./tsamgroup117 4045 "B5 1"
+sama saga með server A 
+
+4. keyra client á báðum servers
+	1. keyra client fyrir server A
+	./client 127.0.0.1 4044
+	kemur upp svona "[2025-10-08 12:56:48] Connected to server 127.0.0.1:4044" þá er client server A ready!
+
+	2. keyra client fyrir server B
+	./client 127.0.0.1 4045
+	kemur upp svona "[2025-10-08 12:57:20] Connected to server 127.0.0.1:4045" 
+
+5. núna getur þú reynt að prufa commands sem eru til 
+	GETMSGS og SENDMSG og annað
+
+6. til að fá logs af þessu þá keyra 
+	tail -f server_log.txt 
+	það á að vera til client_log.txt en ég var ekki búinn að test
+	það
+
+7. núna veit ég ekki meira :)
