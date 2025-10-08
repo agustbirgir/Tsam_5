@@ -1,60 +1,23 @@
-
 CXX := g++
-CXXFLAGS := -std=c++17 -Wall -g -Iinclude
+CXXFLAGS := -Wall -std=c++11 -O2
+INCLUDES := -Iinclude
 
-GROUP_ID := 117
+SRCDIR := src
 
-# Directories
-BIN_DIR := bin
-SRC_DIR := src
-OBJ_DIR := obj
+# Use your filenames server.cpp and client.cpp as entry points
+SOURCES_SERVER := $(SRCDIR)/server.cpp $(SRCDIR)/network_manager.cpp $(SRCDIR)/protocol_handler.cpp $(SRCDIR)/logger.cpp
+SOURCES_CLIENT := $(SRCDIR)/client.cpp $(SRCDIR)/network_manager.cpp $(SRCDIR)/logger.cpp
 
-# Executables
-# The server executable must be named "tsamgroupX" [cite: 65]
-SERVER_EXEC := $(BIN_DIR)/tsamgroup$(GROUP_ID)
-CLIENT_EXEC := $(BIN_DIR)/client
+all: tsamgroup117 client
 
-# --- SOURCE FILES ---
-# Automatically find all .cpp files in the source directory
-SOURCES := $(wildcard $(SRC_DIR)/*.cpp)
+tsamgroup117: $(SOURCES_SERVER)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o tsamgroup117 $(SOURCES_SERVER)
 
-# Define object files that are common to both the server and client
-COMMON_OBJS := $(patsubst $(SRC_DIR)/%.cpp, $(OBJ_DIR)/%.o, $(filter-out $(SRC_DIR)/server_main.cpp $(SRC_DIR)/client_main.cpp, $(SOURCES)))
+client: $(SOURCES_CLIENT)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o client $(SOURCES_CLIENT)
 
-# Define object files specific to server and client
-SERVER_MAIN_OBJ := $(OBJ_DIR)/server_main.o
-CLIENT_MAIN_OBJ := $(OBJ_DIR)/client_main.o
-
-# --- TARGETS ---
-
-# Default target: build everything
-.PHONY: all
-all: $(SERVER_EXEC) $(CLIENT_EXEC)
-
-# Rule to link the server executable
-$(SERVER_EXEC): $(SERVER_MAIN_OBJ) $(COMMON_OBJS)
-	@echo "Linking server executable: $@"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-# Rule to link the client executable
-$(CLIENT_EXEC): $(CLIENT_MAIN_OBJ) $(COMMON_OBJS)
-	@echo "Linking client executable: $@"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-# Pattern rule to compile .cpp files into .o object files
-# -MMD -MP flags generate dependency files (.d) to track header changes
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
-	@echo "Compiling $< -> $@"
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
-
-# Include all the generated dependency files
--include $(wildcard $(OBJ_DIR)/*.d)
-
-# Target to clean up the project (remove bin and obj directories)
-.PHONY: clean
 clean:
-	@echo "Cleaning project..."
-	@rm -rf $(BIN_DIR) $(OBJ_DIR)
+	rm -f tsamgroup117 client *.o server_log.txt client_log.txt
+
+.PHONY: all clean
+
