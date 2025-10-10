@@ -1,5 +1,6 @@
-#include "network.h"
-#include "common.h"
+#include "../include/common.h"
+#include "../include/network.h"
+
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -98,5 +99,16 @@ ssize_t send_all(int sockfd, const std::string &data) {
     return (ssize_t)total;
 }
 
-} // namespace NetworkManager
+ssize_t receive(int sockfd, std::vector<char>& buffer) {
+    char temp_buf[4096];
+    ssize_t bytes_read = recv(sockfd, temp_buf, sizeof(temp_buf), 0);
+
+    if (bytes_read > 0) {
+        buffer.insert(buffer.end(), temp_buf, temp_buf + bytes_read);
+    }
+
+    return bytes_read;
+}
+
+}
 

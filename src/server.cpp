@@ -1,223 +1,88 @@
-// src/server.cpp
-// Server entrypoint (refactored). Uses NetworkManager, ProtocolHandler, Logger.
+#include "../include/common.h"
+#include "../include/logger.h"
+#include "../include/network.h"
+#include "../include/protocol.h"
 
-#include "common.h"
-#include "logger.h"
-#include "network.h"
-#include "protocol.h"
-
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <unistd.h>
-
-#include <cstring>   // strerror
 #include <algorithm>
-#include <chrono>
+#include <chrono> // For the KEEPALIVE timer
 #include <iostream>
 #include <map>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstring>
 
+// Connection struct holds info about each connected socket
 struct ConnInfo {
     int sock;
-    enum Type { UNKNOWN=0, CLIENT=1, SERVERPEER=2 } type;
-    std::string peer_addr;   // ip:port as observed
-    std::string peer_group;  // group string learned from HELO
-    std::string recvbuf;     // accumulated bytes
-    ConnInfo(): sock(-1), type(UNKNOWN) {}
+    enum Type { UNKNOWN = 0, CLIENT = 1, SERVERPEER = 2 } type;
+    std::string peer_addr;
+    std::string peer_group;
+    std::string recvbuf;
+    ConnInfo() : sock(-1), type(UNKNOWN) {}
 };
 
+// --- Global State ---
 static std::map<int, ConnInfo> conns;
 static std::map<std::string, std::vector<std::string>> msgs_for_group;
 static unsigned short g_listen_port = 0;
-static std::string g_group_id = "A117 1";
+static std::string g_group_id = "A5_117"; // Your group ID
 
-static std::string get_peer_ipport(int sock) {
-    auto it = conns.find(sock);
-    if (it != conns.end()) return it->second.peer_addr;
-    return "unknown";
-}
+// --- Forward Declarations ---
+static void handle_payload(int sock, const std::string& payload, bool is_framed);
+static void forward_frame_to_peers(int origin_sock, const std::string& frame);
 
-static std::string build_SERVERS_response(const ConnInfo &request_conn) {
+// Helper function to build the SERVERS response string
+static std::string build_SERVERS_response() {
     std::ostringstream ss;
     ss << "SERVERS";
-    // include remote (the observed peer) first
-    std::string peerip = request_conn.peer_addr;
-    std::string peerip_only = peerip;
-    std::string peerport = "0";
-    auto pos = peerip.find(':');
-    if (pos != std::string::npos) {
-        peerip_only = peerip.substr(0, pos);
-        peerport = peerip.substr(pos+1);
-    }
-    ss << "," << (request_conn.peer_group.empty()? "unknown" : request_conn.peer_group)
-       << "," << peerip_only << "," << peerport;
+    // Assuming 0.0.0.0 is not helpful, let's just send our group and port.
+    // Other servers will know our IP from the socket connection itself.
+    ss << "," << g_group_id << ",0.0.0.0," << g_listen_port;
 
-    // include this server (advertise 0.0.0.0 and our listen port)
-    ss << ";" << g_group_id << ",0.0.0.0," << g_listen_port;
-
-    // include other server peers
-    for (auto &kv : conns) {
-        const ConnInfo &ci = kv.second;
-        if (ci.type != ConnInfo::SERVERPEER) continue;
-        if (ci.sock == request_conn.sock) continue;
+    for (auto const& [sock, ci] : conns) {
+        if (ci.type != ConnInfo::SERVERPEER || ci.peer_group.empty()) continue;
         std::string ip = ci.peer_addr;
         std::string ip_only = ip;
         std::string port = "0";
         auto p = ip.find(':');
-        if (p != std::string::npos) { ip_only = ip.substr(0,p); port = ip.substr(p+1); }
-        ss << ";" << (ci.peer_group.empty()? "unknown" : ci.peer_group) << "," << ip_only << "," << port;
+        if (p != std::string::npos) {
+            ip_only = ip.substr(0, p);
+            port = ip.substr(p + 1);
+        }
+        ss << ";" << ci.peer_group << "," << ip_only << "," << port;
     }
     return ss.str();
 }
 
-static void handle_server_payload(int sock, const std::string &payload) {
-    Logger::log("Server payload received on sock " + std::to_string(sock) + ": " + payload);
-    // split by comma (but message content may contain commas -> reconstruct later)
-    std::vector<std::string> tokens;
-    {
-        std::istringstream ss(payload);
-        std::string tok;
-        while (std::getline(ss, tok, ',')) tokens.push_back(tok);
-    }
-    if (tokens.empty()) return;
-    std::string verb = tokens[0];
-    if (verb == "HELO") {
-        std::string from = (tokens.size()>=2 ? tokens[1] : "unknown");
-        conns[sock].peer_group = from;
-        std::string resp = build_SERVERS_response(conns[sock]);
-        std::string frame = ProtocolHandler::build_frame(resp);
-        NetworkManager::send_all(sock, frame);
-        Logger::log("Replied SERVERS to " + conns[sock].peer_addr + " (" + from + ")");
-    } else if (verb == "SENDMSG") {
-        // SENDMSG,<TO>,<FROM>,<content...>
-        if (tokens.size() >= 4) {
-            std::string to = tokens[1];
-            std::string from = tokens[2];
-            size_t pos = payload.find(tokens[3]);
-            std::string content = (pos==std::string::npos? std::string() : payload.substr(pos));
-            if (content.size() > MSG_LIMIT) content.resize(MSG_LIMIT);
-            std::string stored = from + "|" + content;
-            msgs_for_group[to].push_back(stored);
-            Logger::log("Stored message for " + to + " from " + from + " (via peer SENDMSG)");
-        } else {
-            Logger::log("Malformed SENDMSG from peer");
-        }
-    } else if (verb == "GETMSGS") {
-        if (tokens.size() >= 2) {
-            std::string which = tokens[1];
-            size_t n = msgs_for_group[which].size();
-            std::ostringstream ss; ss << "STATUSRESP," << g_group_id << "," << n;
-            std::string frame = ProtocolHandler::build_frame(ss.str());
-            NetworkManager::send_all(sock, frame);
-        }
-    } else if (verb == "STATUSREQ") {
-        std::ostringstream ss;
-        ss << "STATUSRESP";
-        for (auto &kv : msgs_for_group) {
-            ss << "," << kv.first << "," << kv.second.size();
-        }
-        std::string frame = ProtocolHandler::build_frame(ss.str());
-        NetworkManager::send_all(sock, frame);
-    } else if (verb == "KEEPALIVE") {
-        Logger::log("KEEPALIVE from peer: " + payload);
-    } else {
-        Logger::log("Unknown server command: " + payload);
-    }
+// Helper to add a new connection to our list
+static void add_new_socket_to_master(int sock, fd_set* master, int* maxfd, const std::string& peer_addr) {
+    FD_SET(sock, master);
+    if (sock > *maxfd) *maxfd = sock;
+    ConnInfo ci;
+    ci.sock = sock;
+    ci.type = ConnInfo::UNKNOWN; // We don't know the type until they send a command
+    ci.peer_addr = peer_addr;
+    conns[sock] = ci;
+    Logger::log("Registered new connection from " + peer_addr + " on sock " + std::to_string(sock));
 }
 
-static void forward_sendmsg_to_peers(const std::string &payload) {
-    std::string frame = ProtocolHandler::build_frame(payload);
-    for (auto &kv : conns) {
-        ConnInfo &ci = kv.second;
-        if (ci.type != ConnInfo::SERVERPEER) continue;
-        ssize_t s = NetworkManager::send_all(ci.sock, frame);
-        if (s <= 0) {
-            Logger::log("Forward to peer failed: " + ci.peer_addr);
-        } else {
-            Logger::log("Forwarded SENDMSG to " + ci.peer_addr);
-        }
-    }
-}
-
-static void handle_client_command(int sock, const std::string &line) {
-    Logger::log("Client command from " + get_peer_ipport(sock) + ": " + line);
-    std::vector<std::string> parts;
-    {
-        std::istringstream ss(line);
-        std::string t;
-        while (std::getline(ss, t, ',')) parts.push_back(t);
-    }
-    if (parts.empty()) return;
-    std::string verb = parts[0];
-    if (verb == "SENDMSG") {
-        if (parts.size() >= 3) {
-            std::string to = parts[1];
-            size_t pos = line.find(parts[2]);
-            std::string content = (pos==std::string::npos? std::string() : line.substr(pos));
-            if (content.size() > MSG_LIMIT) { content.resize(MSG_LIMIT); Logger::log("Truncated message to MSG_LIMIT"); }
-            std::string stored = g_group_id + "|" + content;
-            msgs_for_group[to].push_back(stored);
-            std::ostringstream pl;
-            pl << "SENDMSG," << to << "," << g_group_id << "," << content;
-            forward_sendmsg_to_peers(pl.str());
-            NetworkManager::send_all(sock, std::string("OK,SENDMSG stored and forwarded\n"));
-        } else {
-            NetworkManager::send_all(sock, std::string("ERR,Usage: SENDMSG,GROUPID,<message>\n"));
-        }
-    } else if (verb == "GETMSG") {
-        auto it = msgs_for_group.find(g_group_id);
-        if (it != msgs_for_group.end() && !it->second.empty()) {
-            std::string entry = it->second.front();
-            it->second.erase(it->second.begin());
-            size_t p = entry.find('|');
-            std::string from = (p==std::string::npos? "unknown" : entry.substr(0,p));
-            std::string content = (p==std::string::npos? entry : entry.substr(p+1));
-            std::ostringstream out;
-            out << "MSG," << from << "," << content << "\n";
-            NetworkManager::send_all(sock, out.str());
-            Logger::log("Delivered 1 message to local client from " + from);
-        } else {
-            NetworkManager::send_all(sock, std::string("NO_MSG\n"));
-        }
-    } else if (verb == "LISTSERVERS") {
-        std::ostringstream out;
-        out << "SERVERS_LIST";
-        for (auto &kv : conns) {
-            ConnInfo &ci = kv.second;
-            if (ci.type == ConnInfo::SERVERPEER) {
-                out << "," << (ci.peer_group.empty()? "unknown" : ci.peer_group) << ":" << ci.peer_addr;
-            }
-        }
-        out << "\n";
-        NetworkManager::send_all(sock, out.str());
-    } else {
-        NetworkManager::send_all(sock, std::string("ERR,unknown command\n"));
-    }
-}
-
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <listen_port> [group_id]\n", argv[0]);
+int main(int argc, char* argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <listen_port> <group_id> [peer1_ip:port] [peer2_ip:port] ...\n", argv[0]);
         return 1;
     }
     g_listen_port = (unsigned short)atoi(argv[1]);
-    if (argc >= 3) g_group_id = argv[2];
+    g_group_id = argv[2];
 
     Logger::init("server_log.txt");
     Logger::log("Starting server for group: " + g_group_id + " on port " + std::to_string(g_listen_port));
 
     int listenfd = NetworkManager::create_listen_socket(g_listen_port);
     if (listenfd < 0) {
-        Logger::log("Failed to create listen socket");
+        Logger::log("Fatal: Failed to create listen socket");
         return 1;
     }
 
@@ -226,85 +91,226 @@ int main(int argc, char *argv[]) {
     FD_SET(listenfd, &master);
     int maxfd = listenfd;
 
+    // Connect to peers from command line
+    for (int i = 3; i < argc; ++i) {
+        std::string peer_str = argv[i];
+        auto colon_pos = peer_str.find(':');
+        if (colon_pos == std::string::npos) {
+            Logger::log("Skipping invalid peer address: " + peer_str);
+            continue;
+        }
+        std::string host = peer_str.substr(0, colon_pos);
+        unsigned short port = (unsigned short)atoi(peer_str.substr(colon_pos + 1).c_str());
+
+        Logger::log("Attempting to connect to peer " + host + ":" + std::to_string(port));
+        int peer_sock = NetworkManager::connect_to(host, port);
+        if (peer_sock >= 0) {
+            add_new_socket_to_master(peer_sock, &master, &maxfd, peer_str);
+            // We are a server, so we identify with HELO right away
+            conns[peer_sock].type = ConnInfo::SERVERPEER;
+            std::string helo_payload = "HELO," + g_group_id;
+            std::string frame = ProtocolHandler::build_frame(helo_payload);
+            NetworkManager::send_all(peer_sock, frame);
+            Logger::log("Successfully connected to peer and sent HELO.");
+        } else {
+            Logger::log("Failed to connect to peer " + peer_str);
+        }
+    }
+    
+    // Timer for KEEPALIVE
+    auto last_keepalive_time = std::chrono::steady_clock::now();
+
     while (true) {
         fd_set readfs = master;
-        int sel = select(maxfd+1, &readfs, nullptr, nullptr, nullptr);
+        
+        struct timeval timeout;
+        timeout.tv_sec = 10;
+        timeout.tv_usec = 0;
+
+        int sel = select(maxfd + 1, &readfs, nullptr, nullptr, &timeout);
         if (sel < 0) {
             if (errno == EINTR) continue;
             Logger::log("select() error, exiting");
             break;
         }
-        // accept
+        
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_keepalive_time).count() >= 60) {
+            Logger::log("Sending KEEPALIVE to peers.");
+            for(auto const& [sock, ci] : conns) {
+                if (ci.type == ConnInfo::SERVERPEER) {
+                    int msg_count = 0;
+                    if (!ci.peer_group.empty() && msgs_for_group.count(ci.peer_group)) {
+                        msg_count = msgs_for_group.at(ci.peer_group).size();
+                    }
+                    std::string payload = "KEEPALIVE," + std::to_string(msg_count);
+                    std::string frame = ProtocolHandler::build_frame(payload);
+                    NetworkManager::send_all(sock, frame);
+                }
+            }
+            last_keepalive_time = now;
+        }
+
         if (FD_ISSET(listenfd, &readfs)) {
             std::string peer_ip;
             int c = NetworkManager::accept_nonblocking(listenfd, &peer_ip);
             if (c >= 0) {
-                ConnInfo ci;
-                ci.sock = c;
-                ci.type = ConnInfo::UNKNOWN;
-                ci.peer_addr = peer_ip;
-                conns[c] = ci;
-                FD_SET(c, &master);
-                if (c > maxfd) maxfd = c;
-                Logger::log("Accepted connection from " + peer_ip + " sock=" + std::to_string(c));
+                add_new_socket_to_master(c, &master, &maxfd, peer_ip);
             }
         }
-        // iterate conns
+
         std::vector<int> to_erase;
-        for (auto it = conns.begin(); it != conns.end(); ++it) {
-            int s = it->first;
-            ConnInfo &ci = it->second;
-            if (!FD_ISSET(s, &readfs)) continue;
-            char buf[4096];
-            ssize_t r = recv(s, buf, sizeof(buf), 0);
-            if (r == 0) {
-                Logger::log("Connection closed by peer: " + ci.peer_addr);
-                close(s);
-                FD_CLR(s, &master);
-                to_erase.push_back(s);
-                continue;
-            } else if (r < 0) {
-                if (errno == EWOULDBLOCK || errno == EAGAIN) continue;
-                Logger::log(std::string("recv error: ") + strerror(errno));
-                close(s);
-                FD_CLR(s, &master);
-                to_erase.push_back(s);
-                continue;
-            }
-            ci.recvbuf.append(buf, buf + r);
+        for (auto& pair : conns) {
+            int s = pair.first;
+            ConnInfo& ci = pair.second;
 
-            if (ci.type == ConnInfo::UNKNOWN) {
-                if (!ci.recvbuf.empty() && (uint8_t)ci.recvbuf[0] == SOH) {
-                    ci.type = ConnInfo::SERVERPEER;
-                    Logger::log("Marked as SERVERPEER: " + ci.peer_addr);
-                } else {
-                    ci.type = ConnInfo::CLIENT;
-                    Logger::log("Marked as CLIENT: " + ci.peer_addr);
-                }
-            }
+            if (FD_ISSET(s, &readfs)) {
+                std::vector<char> received_data;
+                ssize_t r = NetworkManager::receive(s, received_data);
 
-            if (ci.type == ConnInfo::SERVERPEER) {
-                std::vector<std::string> payloads;
-                ProtocolHandler::extract_frames_from_buffer(ci.recvbuf, payloads);
-                for (auto &pl : payloads) handle_server_payload(s, pl);
-            } else if (ci.type == ConnInfo::CLIENT) {
-                size_t pos;
-                while ((pos = ci.recvbuf.find('\n')) != std::string::npos) {
-                    std::string line = ci.recvbuf.substr(0, pos);
-                    ci.recvbuf.erase(0, pos+1);
-                    handle_client_command(s, line);
+                if (r <= 0) {
+                    if (r == 0) Logger::log("Connection closed by peer: " + ci.peer_addr);
+                    else Logger::log(std::string("recv error on sock ") + std::to_string(s) + ": " + strerror(errno));
+                    to_erase.push_back(s);
+                    continue;
                 }
-                if (ci.recvbuf.size() > MAX_CLIENT_BUF) {
-                    ci.recvbuf.clear();
-                    Logger::log("Cleared oversized client buffer for " + ci.peer_addr);
+
+                ci.recvbuf.append(received_data.begin(), received_data.end());
+
+                // --- FIXED RECEIVE LOGIC ---
+                // First, try to extract standard framed messages (for server-to-server)
+                std::vector<std::string> framed_payloads;
+                ProtocolHandler::extract_frames_from_buffer(ci.recvbuf, framed_payloads);
+                for (const auto& pl : framed_payloads) {
+                    handle_payload(s, pl, true);
+                }
+
+                // Now, check for simple, newline-terminated commands (for our simple client)
+                size_t newline_pos;
+                while ((newline_pos = ci.recvbuf.find('\n')) != std::string::npos) {
+                    std::string client_payload = ci.recvbuf.substr(0, newline_pos);
+                    if (!client_payload.empty() && client_payload.back() == '\r') {
+                        client_payload.pop_back();
+                    }
+                    
+                    if (!client_payload.empty()) {
+                        handle_payload(s, client_payload, false);
+                    }
+                    ci.recvbuf.erase(0, newline_pos + 1);
                 }
             }
         }
-        for (int s : to_erase) conns.erase(s);
+
+        for (int s : to_erase) {
+            close(s);
+            FD_CLR(s, &master);
+            conns.erase(s);
+        }
     }
 
-    for (auto &kv : conns) close(kv.first);
+    for (auto const& [sock, conn_info] : conns) close(sock);
     close(listenfd);
     return 0;
 }
 
+
+// --- Main Command Handler ---
+static void handle_payload(int sock, const std::string& payload, bool is_framed) {
+    Logger::log("Payload from sock " + std::to_string(sock) + " (framed: " + (is_framed ? "yes" : "no") + "): " + payload);
+    std::vector<std::string> tokens;
+    std::istringstream ss(payload);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tokens.push_back(tok);
+    }
+    if (tokens.empty()) return;
+
+    std::string command = tokens[0];
+    ConnInfo& ci = conns.at(sock);
+
+    if (command == "HELO") {
+        ci.type = ConnInfo::SERVERPEER;
+        ci.peer_group = (tokens.size() >= 2 ? tokens[1] : "unknown");
+        Logger::log("Peer " + ci.peer_group + " said HELO from " + ci.peer_addr);
+        std::string resp = build_SERVERS_response();
+        NetworkManager::send_all(sock, ProtocolHandler::build_frame(resp));
+    } 
+    else if (command == "SERVERS") {
+        Logger::log("Received SERVERS list from peer: " + payload);
+    }
+    else if (command == "KEEPALIVE") {
+         Logger::log("Received KEEPALIVE from " + ci.peer_group);
+    }
+    else if (command == "SENDMSG") {
+        if (tokens.size() >= 4) {
+            std::string to_group = tokens[1];
+            std::string from_group = tokens[2];
+            
+            auto first_comma = payload.find(',');
+            auto second_comma = payload.find(',', first_comma + 1);
+            auto third_comma = payload.find(',', second_comma + 1);
+            std::string content = payload.substr(third_comma + 1);
+            if (content.size() > MSG_LIMIT) content.resize(MSG_LIMIT);
+
+            if (to_group == g_group_id) {
+                msgs_for_group[to_group].push_back(from_group + "|" + content);
+                Logger::log("Stored message for my group (" + to_group + ") from " + from_group);
+            } else {
+                Logger::log("Forwarding message for " + to_group + " from " + from_group);
+                std::string forward_frame = ProtocolHandler::build_frame(payload);
+                forward_frame_to_peers(sock, forward_frame);
+            }
+        }
+    }
+    else if (command == "STATUSREQ") {
+        if (ci.type == ConnInfo::UNKNOWN) { ci.type = ConnInfo::CLIENT; }
+        std::ostringstream resp_ss;
+        resp_ss << "STATUSRESP";
+        for (auto const& [group, msg_list] : msgs_for_group) {
+            if (!msg_list.empty()) {
+                resp_ss << "," << group << "," << msg_list.size();
+            }
+        }
+        std::string response_str = resp_ss.str();
+        Logger::log("Responding to STATUSREQ with: " + response_str);
+
+        if (ci.type == ConnInfo::CLIENT) {
+             NetworkManager::send_all(sock, response_str + "\n");
+        } else {
+             NetworkManager::send_all(sock, ProtocolHandler::build_frame(response_str));
+        }
+    }
+    else if (command == "GETMSG") {
+        ci.type = ConnInfo::CLIENT;
+        std::string response_payload;
+        auto it = msgs_for_group.find(g_group_id);
+        if (it != msgs_for_group.end() && !it->second.empty()) {
+            std::string entry = it->second.front();
+            it->second.erase(it->second.begin());
+            
+            auto pipe_pos = entry.find('|');
+            std::string from_group = entry.substr(0, pipe_pos);
+            std::string content = entry.substr(pipe_pos + 1);
+            response_payload = "MSG," + from_group + "," + content;
+            Logger::log("Delivering message to client from " + from_group);
+        } else {
+            response_payload = "NO_MSG";
+        }
+        NetworkManager::send_all(sock, response_payload + "\n");
+    } else if (command == "LISTSERVERS") {
+        ci.type = ConnInfo::CLIENT;
+        std::string response = build_SERVERS_response();
+        NetworkManager::send_all(sock, response + "\n");
+    } else {
+        Logger::log("Unknown command received: " + payload);
+    }
+}
+
+
+static void forward_frame_to_peers(int origin_sock, const std::string& frame) {
+    for (auto const& [peer_sock, ci] : conns) {
+        if (ci.type == ConnInfo::SERVERPEER && peer_sock != origin_sock) {
+            NetworkManager::send_all(peer_sock, frame);
+        }
+    }
+}

@@ -1,7 +1,8 @@
-#ifndef NETWORKMANAGER_HPP
-#define NETWORKMANAGER_HPP
+#ifndef NETWORK_H
+#define NETWORK_H
 
 #include <string>
+#include <vector>
 
 namespace NetworkManager {
     // Create, bind and listen on port. Returns listening socket FD or -1 on error.
@@ -19,7 +20,8 @@ namespace NetworkManager {
 
     // Send all bytes; returns bytes sent or -1
     ssize_t send_all(int sockfd, const std::string &data);
+
+    ssize_t receive(int sockfd, std::vector<char>& buffer);
 }
 
-#endif // NETWORKMANAGER_HPP
-
+#endif // NETWORK_H

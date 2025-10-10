@@ -2,8 +2,10 @@
 // Simple C&C client that connects to local server and speaks plain-text lines.
 // Uses NetworkManager and Logger from project.
 
-#include "network.h"
-#include "logger.h"
+#include "../include/logger.h"
+#include "../include/network.h"
+#include "../include/protocol.h"
+
 
 #include <arpa/inet.h>
 #include <netdb.h>

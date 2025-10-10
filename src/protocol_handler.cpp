@@ -1,5 +1,6 @@
-#include "protocol.h"
-#include "common.h"
+#include "../include/protocol.h"
+#include "../include/common.h":
+
 
 #include <arpa/inet.h>
 #include <cstdint>

@@ -1,5 +1,5 @@
-#ifndef LOGGER_HPP
-#define LOGGER_HPP
+#ifndef LOGGER_H
+#define LOGGER_H
 
 #include <string>
 
@@ -10,5 +10,4 @@ public:
     static void log(const std::string &msg);
 };
 
-#endif // LOGGER_HPP
-
+#endif // LOGGER_H
