@@ -6,7 +6,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <algorithm>
-#include <chrono> // For the KEEPALIVE timer
+#include <chrono> 
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -234,7 +234,7 @@ static void handle_payload(int sock, const std::string& payload, bool is_framed)
         Logger::log("Peer " + ci.peer_group + " said HELO from " + ci.peer_addr);
         std::string resp = build_SERVERS_response();
         NetworkManager::send_all(sock, ProtocolHandler::build_frame(resp));
-    } 
+    }
     else if (command == "SERVERS") {
         Logger::log("Received SERVERS list from peer: " + payload);
     }
@@ -242,24 +242,50 @@ static void handle_payload(int sock, const std::string& payload, bool is_framed)
          Logger::log("Received KEEPALIVE from " + ci.peer_group);
     }
     else if (command == "SENDMSG") {
-        if (tokens.size() >= 4) {
-            std::string to_group = tokens[1];
-            std::string from_group = tokens[2];
+        // --- THIS IS THE CORRECTED LOGIC ---
+
+        std::string to_group, from_group, content, full_payload;
+
+        // Case 1: Message from a client (not framed)
+        if (!is_framed && tokens.size() >= 2) {
+            if (ci.type == ConnInfo::UNKNOWN) ci.type = ConnInfo::CLIENT;
+            
+            to_group = tokens[1];
+            from_group = g_group_id; // The server's own group is the sender
+
+            // Reconstruct message content from the payload
+            auto first_comma = payload.find(',');
+            auto second_comma = payload.find(',', first_comma + 1);
+            content = payload.substr(second_comma + 1);
+
+            full_payload = "SENDMSG," + to_group + "," + from_group + "," + content;
+            Logger::log("Received SENDMSG from client. Full command: " + full_payload);
+        }
+        // Case 2: Message from another server (framed)
+        else if (is_framed && tokens.size() >= 4) {
+            to_group = tokens[1];
+            from_group = tokens[2];
             
             auto first_comma = payload.find(',');
             auto second_comma = payload.find(',', first_comma + 1);
             auto third_comma = payload.find(',', second_comma + 1);
-            std::string content = payload.substr(third_comma + 1);
-            if (content.size() > MSG_LIMIT) content.resize(MSG_LIMIT);
+            content = payload.substr(third_comma + 1);
+            full_payload = payload; // Already in the correct format
+        } else {
+            Logger::log("Malformed SENDMSG command: " + payload);
+            return;
+        }
 
-            if (to_group == g_group_id) {
-                msgs_for_group[to_group].push_back(from_group + "|" + content);
-                Logger::log("Stored message for my group (" + to_group + ") from " + from_group);
-            } else {
-                Logger::log("Forwarding message for " + to_group + " from " + from_group);
-                std::string forward_frame = ProtocolHandler::build_frame(payload);
-                forward_frame_to_peers(sock, forward_frame);
-            }
+        // Now, process the unified, full_payload
+        if (content.size() > MSG_LIMIT) content.resize(MSG_LIMIT);
+
+        if (to_group == g_group_id) {
+            msgs_for_group[to_group].push_back(from_group + "|" + content);
+            Logger::log("Stored message for my group (" + to_group + ") from " + from_group);
+        } else {
+            Logger::log("Forwarding message for " + to_group + " from " + from_group);
+            std::string forward_frame = ProtocolHandler::build_frame(full_payload);
+            forward_frame_to_peers(sock, forward_frame);
         }
     }
     else if (command == "STATUSREQ") {
@@ -278,6 +304,23 @@ static void handle_payload(int sock, const std::string& payload, bool is_framed)
              NetworkManager::send_all(sock, response_str + "\n");
         } else {
              NetworkManager::send_all(sock, ProtocolHandler::build_frame(response_str));
+        }
+    }
+    else if (command == "GETMSGS") {
+        if(tokens.size() >= 2) {
+            std::string requested_group = tokens[1];
+            Logger::log("Peer " + ci.peer_group + " is requesting messages for group " + requested_group);
+            auto it = msgs_for_group.find(requested_group);
+            if (it != msgs_for_group.end()) {
+                for(const auto& msg_entry : it->second) {
+                    auto pipe_pos = msg_entry.find('|');
+                    std::string from_group = msg_entry.substr(0, pipe_pos);
+                    std::string content = msg_entry.substr(pipe_pos + 1);
+                    std::string msg_payload = "SENDMSG," + requested_group + "," + from_group + "," + content;
+                    NetworkManager::send_all(sock, ProtocolHandler::build_frame(msg_payload));
+                }
+                it->second.clear();
+            }
         }
     }
     else if (command == "GETMSG") {
@@ -305,7 +348,6 @@ static void handle_payload(int sock, const std::string& payload, bool is_framed)
         Logger::log("Unknown command received: " + payload);
     }
 }
-
 
 static void forward_frame_to_peers(int origin_sock, const std::string& frame) {
     for (auto const& [peer_sock, ci] : conns) {

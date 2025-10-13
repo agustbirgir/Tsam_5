@@ -20,13 +20,7 @@
 #include <string>
 #include <thread>
 
-static std::string timestamp_now() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t tt = std::chrono::system_clock::to_time_t(now);
-    char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&tt));
-    return std::string(buf);
-}
+
 
 static void logprint(const std::string &s) {
     Logger::log(s);
