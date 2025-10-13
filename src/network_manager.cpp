@@ -1,4 +1,3 @@
-#include "../include/common.h"
 #include "../include/network.h"
 
 
@@ -13,7 +12,6 @@
 #include <cstring>
 #include <string>
 
-// Helper definitions
 namespace NetworkManager {
 
 int create_listen_socket(unsigned short port, int backlog) {

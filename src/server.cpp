@@ -5,7 +5,6 @@
 
 #include <sys/select.h>
 #include <unistd.h>
-#include <algorithm>
 #include <chrono> 
 #include <iostream>
 #include <map>
@@ -14,7 +13,6 @@
 #include <vector>
 #include <cstring>
 
-// Connection struct holds info about each connected socket
 struct ConnInfo {
     int sock;
     enum Type { UNKNOWN = 0, CLIENT = 1, SERVERPEER = 2 } type;
@@ -24,22 +22,17 @@ struct ConnInfo {
     ConnInfo() : sock(-1), type(UNKNOWN) {}
 };
 
-// --- Global State ---
 static std::map<int, ConnInfo> conns;
 static std::map<std::string, std::vector<std::string>> msgs_for_group;
 static unsigned short g_listen_port = 0;
-static std::string g_group_id = "A5_117"; // Your group ID
+static std::string g_group_id = "A5_117";
 
-// --- Forward Declarations ---
 static void handle_payload(int sock, const std::string& payload, bool is_framed);
 static void forward_frame_to_peers(int origin_sock, const std::string& frame);
 
-// Helper function to build the SERVERS response string
 static std::string build_SERVERS_response() {
     std::ostringstream ss;
     ss << "SERVERS";
-    // Assuming 0.0.0.0 is not helpful, let's just send our group and port.
-    // Other servers will know our IP from the socket connection itself.
     ss << "," << g_group_id << ",0.0.0.0," << g_listen_port;
 
     for (auto const& [sock, ci] : conns) {
@@ -57,13 +50,12 @@ static std::string build_SERVERS_response() {
     return ss.str();
 }
 
-// Helper to add a new connection to our list
 static void add_new_socket_to_master(int sock, fd_set* master, int* maxfd, const std::string& peer_addr) {
     FD_SET(sock, master);
     if (sock > *maxfd) *maxfd = sock;
     ConnInfo ci;
     ci.sock = sock;
-    ci.type = ConnInfo::UNKNOWN; // We don't know the type until they send a command
+    ci.type = ConnInfo::UNKNOWN;
     ci.peer_addr = peer_addr;
     conns[sock] = ci;
     Logger::log("Registered new connection from " + peer_addr + " on sock " + std::to_string(sock));
@@ -91,7 +83,6 @@ int main(int argc, char* argv[]) {
     FD_SET(listenfd, &master);
     int maxfd = listenfd;
 
-    // Connect to peers from command line
     for (int i = 3; i < argc; ++i) {
         std::string peer_str = argv[i];
         auto colon_pos = peer_str.find(':');
@@ -106,7 +97,6 @@ int main(int argc, char* argv[]) {
         int peer_sock = NetworkManager::connect_to(host, port);
         if (peer_sock >= 0) {
             add_new_socket_to_master(peer_sock, &master, &maxfd, peer_str);
-            // We are a server, so we identify with HELO right away
             conns[peer_sock].type = ConnInfo::SERVERPEER;
             std::string helo_payload = "HELO," + g_group_id;
             std::string frame = ProtocolHandler::build_frame(helo_payload);
@@ -117,7 +107,6 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    // Timer for KEEPALIVE
     auto last_keepalive_time = std::chrono::steady_clock::now();
 
     while (true) {
@@ -177,15 +166,12 @@ int main(int argc, char* argv[]) {
 
                 ci.recvbuf.append(received_data.begin(), received_data.end());
 
-                // --- FIXED RECEIVE LOGIC ---
-                // First, try to extract standard framed messages (for server-to-server)
                 std::vector<std::string> framed_payloads;
                 ProtocolHandler::extract_frames_from_buffer(ci.recvbuf, framed_payloads);
                 for (const auto& pl : framed_payloads) {
                     handle_payload(s, pl, true);
                 }
 
-                // Now, check for simple, newline-terminated commands (for our simple client)
                 size_t newline_pos;
                 while ((newline_pos = ci.recvbuf.find('\n')) != std::string::npos) {
                     std::string client_payload = ci.recvbuf.substr(0, newline_pos);
@@ -214,7 +200,6 @@ int main(int argc, char* argv[]) {
 }
 
 
-// --- Main Command Handler ---
 static void handle_payload(int sock, const std::string& payload, bool is_framed) {
     Logger::log("Payload from sock " + std::to_string(sock) + " (framed: " + (is_framed ? "yes" : "no") + "): " + payload);
     std::vector<std::string> tokens;
@@ -242,18 +227,15 @@ static void handle_payload(int sock, const std::string& payload, bool is_framed)
          Logger::log("Received KEEPALIVE from " + ci.peer_group);
     }
     else if (command == "SENDMSG") {
-        // --- THIS IS THE CORRECTED LOGIC ---
 
         std::string to_group, from_group, content, full_payload;
 
-        // Case 1: Message from a client (not framed)
         if (!is_framed && tokens.size() >= 2) {
             if (ci.type == ConnInfo::UNKNOWN) ci.type = ConnInfo::CLIENT;
             
             to_group = tokens[1];
-            from_group = g_group_id; // The server's own group is the sender
+            from_group = g_group_id;
 
-            // Reconstruct message content from the payload
             auto first_comma = payload.find(',');
             auto second_comma = payload.find(',', first_comma + 1);
             content = payload.substr(second_comma + 1);
@@ -261,7 +243,6 @@ static void handle_payload(int sock, const std::string& payload, bool is_framed)
             full_payload = "SENDMSG," + to_group + "," + from_group + "," + content;
             Logger::log("Received SENDMSG from client. Full command: " + full_payload);
         }
-        // Case 2: Message from another server (framed)
         else if (is_framed && tokens.size() >= 4) {
             to_group = tokens[1];
             from_group = tokens[2];
@@ -270,13 +251,12 @@ static void handle_payload(int sock, const std::string& payload, bool is_framed)
             auto second_comma = payload.find(',', first_comma + 1);
             auto third_comma = payload.find(',', second_comma + 1);
             content = payload.substr(third_comma + 1);
-            full_payload = payload; // Already in the correct format
+            full_payload = payload;
         } else {
             Logger::log("Malformed SENDMSG command: " + payload);
             return;
         }
 
-        // Now, process the unified, full_payload
         if (content.size() > MSG_LIMIT) content.resize(MSG_LIMIT);
 
         if (to_group == g_group_id) {
